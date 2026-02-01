@@ -6,6 +6,7 @@ import { useInviteCode } from './organizationController';
 interface SignupRequest {
     email: string;
     full_name: string;
+    username: string;
     role?: string;
     organization_id?: string;
     invite_code?: string;
@@ -131,12 +132,13 @@ export async function signup(req: Request, res: Response): Promise<void> {
         }
 
         const { error: mappingError } = await supabase
-            .from('identity_mapping')
-            .insert({
-                email_hash: emailHash,
-                uin,
-                organization_id: finalOrgId
-            });
+  .from('identity_mapping')
+  .insert({
+      email_hash: emailHash,
+      username: username.toLowerCase(),
+      uin,
+      organization_id: finalOrgId
+  });
 
         if (mappingError) {
             // Rollback: delete the directory entry if mapping fails
