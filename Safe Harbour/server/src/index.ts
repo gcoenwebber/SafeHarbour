@@ -2,6 +2,8 @@ import express, { Request, Response } from 'express';
 import { createServer } from 'http';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import { getRedisConnection } from './queues/redisConnection';
+import { supabase } from './config/supabase';
 import { signup, lookupByEmail } from './controllers/authController';
 import { searchDirectory } from './controllers/directoryController';
 import { submitReport, getReportStatus } from './controllers/reportController';
@@ -55,11 +57,50 @@ try {
 app.use(cors());
 app.use(express.json());
 
-// Health check route
+// Health check route (simple)
 app.get('/health', (req: Request, res: Response) => {
     res.status(200).json({
         status: 'ok',
         message: 'Server is running',
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Deep health check route (for UptimeRobot - pings Redis + Supabase)
+app.get('/healthz', async (req: Request, res: Response) => {
+    const checks: Record<string, boolean> = {};
+    let healthy = true;
+
+    // Check Redis
+    try {
+        const redis = getRedisConnection();
+        const pong = await redis.ping();
+        checks.redis = pong === 'PONG';
+    } catch {
+        checks.redis = false;
+        healthy = false;
+    }
+
+    // Check Supabase
+    try {
+        if (supabase) {
+            const { error } = await supabase
+                .from('public_directory')
+                .select('uin')
+                .limit(1);
+            checks.supabase = !error;
+        } else {
+            checks.supabase = false;
+            healthy = false;
+        }
+    } catch {
+        checks.supabase = false;
+        healthy = false;
+    }
+
+    res.status(healthy ? 200 : 503).json({
+        status: healthy ? 'ok' : 'degraded',
+        checks,
         timestamp: new Date().toISOString()
     });
 });
