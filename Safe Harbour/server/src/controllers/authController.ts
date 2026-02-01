@@ -1,3 +1,4 @@
+// server/controllers/authController.ts
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabase';
 import { generateUIN, hashEmail, isValidEmail } from '../utils/identity';
@@ -6,7 +7,7 @@ import { useInviteCode } from './organizationController';
 interface SignupRequest {
     email: string;
     full_name: string;
-    username: string;
+    username: string;          // NEW: required for mentions
     role?: string;
     organization_id?: string;
     invite_code?: string;
@@ -14,17 +15,14 @@ interface SignupRequest {
 
 /**
  * Signup Controller
- * 
- * Handles user registration by:
- * 1. Validating the input
- * 2. Hashing the user's email for blind indexing
- * 3. Generating a non-enumerable UIN
- * 4. Saving the identity mapping (email_hash -> UIN)
- * 5. Adding user to public_directory (without email)
+ * Handles user registration:
+ * 1. Validates input
+ * 2. Hashes email for privacy
+ * 3. Generates a non-enumerable UIN
+ * 4. Inserts into identity_mapping and public_directory
  */
 export async function signup(req: Request, res: Response): Promise<void> {
     try {
-        // Check if Supabase is configured
         if (!supabase) {
             res.status(503).json({
                 error: 'Database not configured',
@@ -33,14 +31,27 @@ export async function signup(req: Request, res: Response): Promise<void> {
             return;
         }
 
-        const { email, full_name, role, organization_id, invite_code }: SignupRequest = req.body;
+        const { email, full_name, username, role, organization_id, invite_code }: SignupRequest = req.body;
 
-        // Validate required fields
-        if (!email || !full_name) {
+        // --- Validate required fields ---
+        if (!email || !full_name || !username) {
             res.status(400).json({
                 error: 'Missing required fields',
-                required: ['email', 'full_name']
+                required: ['email', 'full_name', 'username']
             });
+            return;
+        }
+
+        // Validate email format
+        if (!isValidEmail(email)) {
+            res.status(400).json({ error: 'Invalid email format' });
+            return;
+        }
+
+        // Validate username format
+        const usernameRegex = /^[a-zA-Z0-9._-]+$/;
+        if (!usernameRegex.test(username)) {
+            res.status(400).json({ error: 'Invalid username format. Only letters, numbers, dots, underscores, and dashes allowed.' });
             return;
         }
 
@@ -52,13 +63,7 @@ export async function signup(req: Request, res: Response): Promise<void> {
             return;
         }
 
-        // Validate email format
-        if (!isValidEmail(email)) {
-            res.status(400).json({ error: 'Invalid email format' });
-            return;
-        }
-
-        // If invite code provided, validate and get org/role from it
+        // --- Resolve invite code if provided ---
         let finalRole = role || 'Employee';
         let finalOrgId = organization_id;
         let icRole: string | undefined;
@@ -79,10 +84,10 @@ export async function signup(req: Request, res: Response): Promise<void> {
             return;
         }
 
-        // Hash the email for blind indexing
+        // --- Hash email for blind indexing ---
         const emailHash = hashEmail(email);
 
-        // Check if user already exists
+        // --- Check if user/email already exists ---
         const { data: existingUser } = await supabase
             .from('identity_mapping')
             .select('uin')
@@ -90,26 +95,27 @@ export async function signup(req: Request, res: Response): Promise<void> {
             .single();
 
         if (existingUser) {
-            res.status(409).json({ error: 'User already exists' });
+            res.status(409).json({ error: 'User with this email already exists' });
             return;
         }
 
-        // Get the next sequential ID for UIN generation
-        // We use a counter approach - get the current max ID and increment
-        const { data: maxIdResult } = await supabase
-            .from('public_directory')
-            .select('id')
-            .order('created_at', { ascending: false })
-            .limit(1);
+        // --- Check if username is already taken ---
+        const { data: existingUsername } = await supabase
+            .from('identity_mapping')
+            .select('uin')
+            .eq('username', username.toLowerCase())
+            .single();
 
-        // Generate a sequential ID based on timestamp + random to ensure uniqueness
-        const sequentialId = Date.now() % 0xFFFFFFFF; // Keep within 32-bit range
+        if (existingUsername) {
+            res.status(409).json({ error: 'Username already taken' });
+            return;
+        }
 
-        // Generate the non-enumerable UIN
+        // --- Generate non-enumerable UIN ---
+        const sequentialId = Date.now() % 0xFFFFFFFF; // 32-bit
         const uin = generateUIN(sequentialId);
 
-        // Start a transaction-like operation
-        // First, add to public_directory (without email - privacy preserving)
+        // --- Insert into public_directory (no email stored) ---
         const { data: directoryEntry, error: directoryError } = await supabase
             .from('public_directory')
             .insert({
@@ -131,17 +137,18 @@ export async function signup(req: Request, res: Response): Promise<void> {
             return;
         }
 
+        // --- Insert into identity_mapping ---
         const { error: mappingError } = await supabase
-  .from('identity_mapping')
-  .insert({
-      email_hash: emailHash,
-      username: username.toLowerCase(),
-      uin,
-      organization_id: finalOrgId
-  });
+            .from('identity_mapping')
+            .insert({
+                email_hash: emailHash,
+                username: username.toLowerCase(), // ✅ stored for mentions
+                uin,
+                organization_id: finalOrgId
+            });
 
         if (mappingError) {
-            // Rollback: delete the directory entry if mapping fails
+            // Rollback public_directory entry
             await supabase
                 .from('public_directory')
                 .delete()
@@ -155,12 +162,13 @@ export async function signup(req: Request, res: Response): Promise<void> {
             return;
         }
 
-        // Success response
+        // --- Success ---
         res.status(201).json({
             message: 'User registered successfully',
             user: {
                 uin,
                 full_name,
+                username: username.toLowerCase(),
                 role: finalRole,
                 ic_role: icRole,
                 organization_id: finalOrgId
@@ -178,11 +186,10 @@ export async function signup(req: Request, res: Response): Promise<void> {
 
 /**
  * Lookup user by email (for internal use)
- * Returns the UIN without exposing the email
+ * Returns the UIN without exposing email
  */
 export async function lookupByEmail(req: Request, res: Response): Promise<void> {
     try {
-        // Check if Supabase is configured
         if (!supabase) {
             res.status(503).json({
                 error: 'Database not configured',
@@ -202,7 +209,7 @@ export async function lookupByEmail(req: Request, res: Response): Promise<void> 
 
         const { data, error } = await supabase
             .from('identity_mapping')
-            .select('uin, organization_id')
+            .select('uin, organization_id, username')
             .eq('email_hash', emailHash)
             .single();
 
@@ -211,17 +218,20 @@ export async function lookupByEmail(req: Request, res: Response): Promise<void> 
             return;
         }
 
-        // Get full user info from public_directory
         const { data: userInfo } = await supabase
             .from('public_directory')
             .select('uin, full_name, role, organization_id')
             .eq('uin', data.uin)
             .single();
 
-        res.status(200).json({ user: userInfo });
+        res.status(200).json({ user: { ...userInfo, username: data.username } });
 
     } catch (error) {
         console.error('Lookup error:', error);
-        res.status(500).json({ error: 'Internal server error' });
+        res.status(500).json({
+            error: 'Internal server error',
+            details: error instanceof Error ? error.message : 'Unknown error'
+        });
     }
 }
+
